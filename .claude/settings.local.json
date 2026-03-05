@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/Scripts/python.exe:*)",
+      "Bash(echo hello-agents not installed:*)",
+      "Bash(echo hello_agents not found:*)",
+      "Bash(tail:*)",
+      "WebFetch(domain:docs.langchain.com)",
+      "Bash(cd \"E:/helloagents-trip-planner/backend\" && python test_imports.py 2>&1)",
+      "Bash(cd:*)",
+      "Bash(grep:*)",
+      "Bash(head:*)",
+      "Bash(tee:*)",
+      "Bash(echo uvx not found:*)",
+      "Bash(cd E:\\\\helloagents-trip-planner\\\\backend:*)",
+      "Bash(.:*)",
+      "Bash(venv/Scripts/python:*)",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python:*)",
+      "Bash(source:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(timeout 5 netstat:*)"
+    ]
+  }
+}

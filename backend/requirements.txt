@@ -1,0 +1,40 @@
+# LangChain框架
+langchain>=0.2.16
+langchain-core>=1.0.0
+langgraph>=0.1.0
+langchain-openai>=0.1.0
+langchain-community>=0.2.0  # 社区工具支持
+langchain-mcp-adapters>=0.2.0  # MCP协议适配器支持
+
+# FastAPI和相关依赖
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# HTTP客户端
+httpx>=0.27.0
+aiohttp>=3.10.0
+
+# 环境变量管理
+python-dotenv>=1.0.0
+
+# CORS支持
+python-multipart>=0.0.9
+
+# 日志
+loguru>=0.7.0
+
+# 异步支持
+nest-asyncio>=1.5.0
+
+# 类型提示支持
+typing_extensions>=4.0.0
+
+# 其他工具
+python-dateutil>=2.8.2
+huggingface_hub>=0.25.0
+mcp>=1.0.0  # MCP协议实现
+openai>=1.0.0  # OpenAI客户端（支持DeepSeek等兼容API）
+tiktoken>=0.5.0  # token计数
+tenacity>=8.2.0  # 重试逻辑

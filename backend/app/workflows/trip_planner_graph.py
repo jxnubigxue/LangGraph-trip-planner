@@ -5,10 +5,13 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from langchain_core.messages import HumanMessage
 from langgraph.graph import END, StateGraph
@@ -77,6 +80,13 @@ class TripPlannerWorkflow:
         self._tool_input_keys_cache: Dict[str, set[str]] = {}
         self._city_adcode_cache: Dict[str, str] = dict(CITY_ADCODE_MAP)
         self._poi_detail_cache: Dict[str, Dict[str, Any]] = {}
+        self._poi_detail_cache_lock = threading.Lock()
+        workers_raw = os.getenv("DETAIL_ENRICH_WORKERS", "3").strip()
+        try:
+            workers = int(workers_raw)
+        except ValueError:
+            workers = 3
+        self._detail_enrich_workers = max(1, min(workers, 6))
 
         if self.tools:
             logger.info("Loaded %d MCP tools", len(self.tools))
@@ -216,7 +226,12 @@ class TripPlannerWorkflow:
         request = state["request"]
         breakdown = state.get("task_breakdown") or {}
         weather_task = breakdown.get("weather", {}) if isinstance(breakdown, dict) else {}
-        city = self._safe_str(weather_task.get("city"), request.city)
+        task_city = self._safe_str(weather_task.get("city"), "")
+        city = task_city or self._safe_str(request.city, "")
+        if not self._resolve_city_adcode(city):
+            req_city = self._safe_str(request.city, "")
+            if req_city and req_city != city and self._resolve_city_adcode(req_city):
+                city = req_city
 
         source = "mcp"
         weather_info: List[WeatherInfo] = []
@@ -908,16 +923,47 @@ class TripPlannerWorkflow:
                 return str(value)
         return str(value)
 
+    def _is_adcode(self, value: str) -> bool:
+        return bool(re.fullmatch(r"\d{6}", self._safe_str(value, "")))
+
+    def _normalize_city_name(self, city: str) -> str:
+        text = self._safe_str(city, "")
+        if not text:
+            return ""
+        text = text.replace(" ", "").replace("\u3000", "")
+        if text.startswith("中国") and len(text) > 2:
+            text = text[2:]
+
+        suffixes = (
+            "特别行政区",
+            "维吾尔自治区",
+            "壮族自治区",
+            "回族自治区",
+            "自治区",
+            "省",
+            "市",
+        )
+        for suffix in suffixes:
+            if text.endswith(suffix) and len(text) > len(suffix):
+                text = text[: -len(suffix)]
+                break
+        return text
+
     def _build_city_candidates(self, city: str) -> List[str]:
         city_text = self._safe_str(city, "")
         if not city_text:
             return []
-        candidates = [city_text]
-        if not city_text.endswith("市"):
-            candidates.append(f"{city_text}市")
+        normalized = self._normalize_city_name(city_text)
+
+        candidates: List[str] = []
         adcode = self._resolve_city_adcode(city_text)
         if adcode:
             candidates.append(adcode)
+        candidates.append(city_text)
+        if normalized and normalized != city_text:
+            candidates.append(normalized)
+        if normalized and not self._is_adcode(normalized):
+            candidates.append(f"{normalized}市")
         # Keep order and dedupe.
         output: List[str] = []
         seen: set[str] = set()
@@ -933,33 +979,69 @@ class TripPlannerWorkflow:
         city_text = self._safe_str(city, "")
         if not city_text:
             return ""
-        if city_text in self._city_adcode_cache:
-            return self._city_adcode_cache[city_text]
-        short_city = city_text[:-1] if city_text.endswith("市") else city_text
-        if short_city in self._city_adcode_cache:
-            ad = self._city_adcode_cache[short_city]
-            self._city_adcode_cache[city_text] = ad
-            return ad
+        if self._is_adcode(city_text):
+            return city_text
+
+        short_city = self._normalize_city_name(city_text)
+        probes: List[str] = []
+        for value in (city_text, short_city, f"{short_city}市" if short_city else ""):
+            key = self._safe_str(value, "")
+            if key and key not in probes:
+                probes.append(key)
+
+        for key in probes:
+            ad = self._safe_str(self._city_adcode_cache.get(key), "")
+            if ad:
+                self._city_adcode_cache[city_text] = ad
+                return ad
+
+        # Fuzzy map matching, e.g. “杭州市西湖区” -> “杭州”.
+        for key, value in self._city_adcode_cache.items():
+            if not key:
+                continue
+            if key in city_text or city_text in key or (short_city and (key in short_city or short_city in key)):
+                ad = self._safe_str(value, "")
+                if ad:
+                    self._city_adcode_cache[city_text] = ad
+                    if short_city:
+                        self._city_adcode_cache[short_city] = ad
+                    return ad
 
         tool = self._find_tool("maps_geo")
         if tool is None:
             return ""
 
-        for address in (city_text, short_city, f"{short_city}市"):
+        for address in probes:
             payload = {"address": address}
             try:
                 raw = self._tool_result_to_text(tool.invoke(payload))
                 parsed = self._safe_parse_json_payload(raw)
                 if isinstance(parsed, dict):
-                    records = parsed.get("return")
-                    if isinstance(records, list) and records:
-                        first = records[0]
-                        if isinstance(first, dict):
-                            adcode = self._safe_str(first.get("adcode"), "")
-                            if adcode:
-                                self._city_adcode_cache[city_text] = adcode
+                    adcode = self._safe_str(parsed.get("adcode"), "")
+                    if not adcode:
+                        adcode = self._safe_str(parsed.get("citycode"), "")
+                    if adcode:
+                        self._city_adcode_cache[city_text] = adcode
+                        if short_city:
+                            self._city_adcode_cache[short_city] = adcode
+                        return adcode
+
+                records: Any = None
+                if isinstance(parsed, dict):
+                    records = parsed.get("return") or parsed.get("geocodes") or parsed.get("data")
+                elif isinstance(parsed, list):
+                    records = parsed
+                if isinstance(records, list) and records:
+                    first = records[0]
+                    if isinstance(first, dict):
+                        adcode = self._safe_str(first.get("adcode"), "")
+                        if not adcode:
+                            adcode = self._safe_str(first.get("citycode"), "")
+                        if adcode:
+                            self._city_adcode_cache[city_text] = adcode
+                            if short_city:
                                 self._city_adcode_cache[short_city] = adcode
-                                return adcode
+                            return adcode
             except Exception:
                 continue
         return ""
@@ -1343,8 +1425,10 @@ class TripPlannerWorkflow:
         pid = self._safe_str(poi_id, "")
         if not pid:
             return None
-        if pid in self._poi_detail_cache:
-            return self._poi_detail_cache[pid]
+        with self._poi_detail_cache_lock:
+            cached = self._poi_detail_cache.get(pid)
+        if cached is not None:
+            return cached
 
         tool = self._find_tool("maps_search_detail")
         if tool is None:
@@ -1360,7 +1444,8 @@ class TripPlannerWorkflow:
                 error_text = self._extract_tool_error(parsed)
                 if error_text:
                     return None
-                self._poi_detail_cache[pid] = parsed
+                with self._poi_detail_cache_lock:
+                    self._poi_detail_cache[pid] = parsed
                 return parsed
         except Exception:
             return None
@@ -1376,6 +1461,63 @@ class TripPlannerWorkflow:
             if value not in (None, "", []):
                 merged[key] = value
         return merged
+
+    def _enrich_items_with_detail(
+        self,
+        items: List[Dict[str, Any]],
+        should_enrich: Callable[[Dict[str, Any]], bool],
+        detail_budget: int,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        if not items or detail_budget <= 0:
+            return items, 0
+
+        candidates: List[Tuple[int, Dict[str, Any]]] = []
+        for idx, item in enumerate(items):
+            if len(candidates) >= detail_budget:
+                break
+            if not isinstance(item, dict):
+                continue
+            poi_id = self._safe_str(item.get("id") or item.get("poi_id"), "")
+            if not poi_id:
+                continue
+            if should_enrich(item):
+                candidates.append((idx, item))
+
+        if not candidates:
+            return items, 0
+
+        updated = list(items)
+        workers = min(self._detail_enrich_workers, len(candidates))
+        workers = max(1, workers)
+
+        if workers <= 1:
+            for idx, item in candidates:
+                updated[idx] = self._enrich_item_with_detail(item)
+            return updated, len(candidates)
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="poi-detail") as executor:
+                future_to_idx = {
+                    executor.submit(self._enrich_item_with_detail, item): idx
+                    for idx, item in candidates
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        result = future.result()
+                        if isinstance(result, dict):
+                            updated[idx] = result
+                    except Exception as exc:
+                        logger.debug("POI detail enrich failed idx=%d: %s", idx, exc)
+        except Exception as exc:
+            logger.warning("POI detail parallel enrich failed, fallback to serial: %s", exc)
+            for idx, item in candidates:
+                try:
+                    updated[idx] = self._enrich_item_with_detail(item)
+                except Exception:
+                    continue
+
+        return updated, len(candidates)
 
     # ---------------------------------------------------------------------
     # Data parsers
@@ -1421,19 +1563,21 @@ class TripPlannerWorkflow:
         return not (abs(lng) < 1e-8 and abs(lat) < 1e-8)
 
     def _parse_attractions(self, response: str) -> List[Attraction]:
+        started = time.perf_counter()
         parsed = self._safe_parse_json_payload(response)
         if parsed is None:
             return []
         records = self._unwrap_records(parsed)
         attractions: List[Attraction] = []
-        for item in records[:40]:
-            if not isinstance(item, dict):
-                continue
-            enriched = dict(item)
-            location = self._parse_location(item.get("location"), item)
-            if not self._is_valid_location(location):
-                enriched = self._enrich_item_with_detail(enriched)
-                location = self._parse_location(enriched.get("location"), enriched)
+        raw_items = [dict(item) for item in records[:40] if isinstance(item, dict)]
+        detail_budget = 10
+        raw_items, detail_calls = self._enrich_items_with_detail(
+            raw_items,
+            should_enrich=lambda item: not self._is_valid_location(self._parse_location(item.get("location"), item)),
+            detail_budget=detail_budget,
+        )
+        for enriched in raw_items:
+            location = self._parse_location(enriched.get("location"), enriched)
             if not self._is_valid_location(location):
                 continue
             category = self._safe_str(enriched.get("category"), "")
@@ -1454,6 +1598,14 @@ class TripPlannerWorkflow:
                     ticket_price=self._safe_int(enriched.get("ticket_price"), 0),
                 )
             )
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.info(
+            "parse_done type=attractions records=%d output=%d detail_calls=%d elapsed_ms=%d",
+            len(records),
+            len(attractions),
+            detail_calls,
+            elapsed_ms,
+        )
         return attractions
 
     def _parse_weather(self, response: str) -> List[WeatherInfo]:
@@ -1510,25 +1662,26 @@ class TripPlannerWorkflow:
         return weather_info
 
     def _parse_hotels(self, response: str) -> List[Hotel]:
+        started = time.perf_counter()
         parsed = self._safe_parse_json_payload(response)
         if parsed is None:
             return []
         records = self._unwrap_records(parsed)
         hotels: List[Hotel] = []
-        for item in records[:30]:
-            if not isinstance(item, dict):
-                continue
-            enriched = dict(item)
+        raw_items = [dict(item) for item in records[:30] if isinstance(item, dict)]
+        detail_budget = 4
+        raw_items, detail_calls = self._enrich_items_with_detail(
+            raw_items,
+            should_enrich=lambda item: (
+                not self._safe_str(item.get("name"), "") or not self._safe_str(item.get("address"), "")
+            ),
+            detail_budget=detail_budget,
+        )
+        for enriched in raw_items:
             location = None
-            if item.get("location") is not None or item.get("longitude") is not None or item.get("lng") is not None:
-                loc = self._parse_location(item.get("location"), item)
-                if self._is_valid_location(loc):
-                    location = loc
-            if location is None:
-                enriched = self._enrich_item_with_detail(enriched)
-                loc = self._parse_location(enriched.get("location"), enriched)
-                if self._is_valid_location(loc):
-                    location = loc
+            loc = self._parse_location(enriched.get("location"), enriched)
+            if self._is_valid_location(loc):
+                location = loc
             hotels.append(
                 Hotel(
                     name=self._safe_str(enriched.get("name"), "推荐酒店"),
@@ -1541,6 +1694,14 @@ class TripPlannerWorkflow:
                     estimated_cost=self._safe_int(enriched.get("estimated_cost"), 0),
                 )
             )
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.info(
+            "parse_done type=hotels records=%d output=%d detail_calls=%d elapsed_ms=%d",
+            len(records),
+            len(hotels),
+            detail_calls,
+            elapsed_ms,
+        )
         return hotels
 
     def _parse_trip_plan(

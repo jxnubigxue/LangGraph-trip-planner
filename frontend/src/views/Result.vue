@@ -50,8 +50,8 @@
               <span>📍 景点地图</span>
             </a-menu-item>
             <a-sub-menu key="days" title="📅 每日行程">
-              <a-menu-item v-for="(day, index) in tripPlan.days" :key="`day-${index}`">
-                第{{ day.day_index + 1 }}天
+              <a-menu-item v-for="(_day, dayIdx) in tripPlan.days" :key="`day-${dayIdx}`">
+                第{{ dayIdx + 1 }}天
               </a-menu-item>
             </a-sub-menu>
             <a-menu-item key="weather" v-if="tripPlan.weather_info && tripPlan.weather_info.length > 0">
@@ -120,13 +120,13 @@
         <a-card title="📅 每日行程" :bordered="false" class="days-card">
           <a-collapse v-model:activeKey="activeDays" accordion>
             <a-collapse-panel
-              v-for="(day, index) in tripPlan.days"
-              :key="index"
-              :id="`day-${index}`"
+              v-for="(day, dayIdx) in tripPlan.days"
+              :key="dayIdx"
+              :id="`day-${dayIdx}`"
             >
               <template #header>
                 <div class="day-header">
-                  <span class="day-title">第{{ day.day_index + 1 }}天</span>
+                  <span class="day-title">第{{ dayIdx + 1 }}天</span>
                   <span class="day-date">{{ day.date }}</span>
                 </div>
               </template>
@@ -161,14 +161,14 @@
                         <a-space>
                           <a-button
                             size="small"
-                            @click="moveAttraction(day.day_index, index, 'up')"
+                            @click="moveAttraction(dayIdx, index, 'up')"
                             :disabled="index === 0"
                           >
                             ↑
                           </a-button>
                           <a-button
                             size="small"
-                            @click="moveAttraction(day.day_index, index, 'down')"
+                            @click="moveAttraction(dayIdx, index, 'down')"
                             :disabled="index === day.attractions.length - 1"
                           >
                             ↓
@@ -176,7 +176,7 @@
                           <a-button
                             size="small"
                             danger
-                            @click="deleteAttraction(day.day_index, index)"
+                            @click="deleteAttraction(dayIdx, index)"
                           >
                             🗑️
                           </a-button>
@@ -230,11 +230,11 @@
                   <span class="hotel-title">{{ day.hotel.name }}</span>
                 </template>
                 <a-descriptions :column="2" size="small">
-                  <a-descriptions-item label="地址">{{ day.hotel.address }}</a-descriptions-item>
-                  <a-descriptions-item label="类型">{{ day.hotel.type }}</a-descriptions-item>
-                  <a-descriptions-item label="价格范围">{{ day.hotel.price_range }}</a-descriptions-item>
-                  <a-descriptions-item label="评分">{{ day.hotel.rating }}⭐</a-descriptions-item>
-                  <a-descriptions-item label="距离" :span="2">{{ day.hotel.distance }}</a-descriptions-item>
+                  <a-descriptions-item label="地址">{{ day.hotel.address || '地址待补充' }}</a-descriptions-item>
+                  <a-descriptions-item label="类型">{{ day.hotel.type || '酒店' }}</a-descriptions-item>
+                  <a-descriptions-item label="价格范围">{{ day.hotel.price_range || '价格待补充' }}</a-descriptions-item>
+                  <a-descriptions-item label="评分">{{ day.hotel.rating ? `${day.hotel.rating}⭐` : '暂无评分' }}</a-descriptions-item>
+                  <a-descriptions-item label="距离" :span="2">{{ day.hotel.distance || '距离待补充' }}</a-descriptions-item>
                 </a-descriptions>
               </a-card>
 
@@ -318,6 +318,7 @@ import jsPDF from 'jspdf'
 import type { TripPlan } from '@/types'
 
 const router = useRouter()
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 const tripPlan = ref<TripPlan | null>(null)
 const editMode = ref(false)
 const originalPlan = ref<TripPlan | null>(null)
@@ -325,6 +326,7 @@ const attractionPhotos = ref<Record<string, string>>({})
 const activeSection = ref('overview')
 const activeDays = ref<number[]>([0]) // 默认展开第一天
 let map: any = null
+let amapLoadPromise: Promise<any> | null = null
 
 onMounted(async () => {
   const data = sessionStorage.getItem('tripPlan')
@@ -432,7 +434,7 @@ const loadAttractionPhotos = async () => {
 
   tripPlan.value.days.forEach(day => {
     day.attractions.forEach(attraction => {
-      const promise = fetch(`http://localhost:8000/api/poi/photo?name=${encodeURIComponent(attraction.name)}`)
+      const promise = fetch(`${API_BASE_URL}/api/poi/photo?name=${encodeURIComponent(attraction.name)}`)
         .then(res => res.json())
         .then(data => {
           if (data.success && data.data.photo_url) {
@@ -786,99 +788,123 @@ const exportAsPDF = async () => {
   }
 }
 
-// 截取地图图片
-const captureMapImage = async () => {
-  if (!map) return
-
-  try {
-    // 获取地图容器
-    const mapContainer = document.getElementById('amap-container')
-    if (!mapContainer) return
-
-    // 使用高德地图的截图功能
-    const mapCanvas = mapContainer.querySelector('canvas')
-    if (mapCanvas) {
-      // 创建一个img元素替换地图容器
-      const img = document.createElement('img')
-      img.src = mapCanvas.toDataURL('image/png')
-      img.style.width = '100%'
-      img.style.height = '500px'
-      img.style.objectFit = 'cover'
-      img.id = 'map-snapshot'
-
-      // 隐藏原地图,显示截图
-      mapContainer.style.display = 'none'
-      mapContainer.parentElement?.appendChild(img)
-    }
-  } catch (error) {
-    console.error('截取地图失败:', error)
-  }
-}
-
-// 恢复地图
-const restoreMap = () => {
-  const mapContainer = document.getElementById('amap-container')
-  const snapshot = document.getElementById('map-snapshot')
-
-  if (mapContainer) {
-    mapContainer.style.display = 'block'
-  }
-
-  if (snapshot) {
-    snapshot.remove()
-  }
-}
-
 // 初始化地图
+const loadAmapSdk = async () => {
+  if (amapLoadPromise) return amapLoadPromise
+
+  const jsKey = import.meta.env.VITE_AMAP_WEB_JS_KEY
+  const securityJsCode = import.meta.env.VITE_AMAP_SECURITY_JS_CODE
+
+  if (!jsKey) {
+    throw new Error('VITE_AMAP_WEB_JS_KEY is missing')
+  }
+
+  if (securityJsCode) {
+    ;(window as any)._AMapSecurityConfig = { securityJsCode }
+  }
+
+  amapLoadPromise = AMapLoader.load({
+    key: jsKey,
+    version: '2.0',
+    plugins: ['AMap.Polyline', 'AMap.InfoWindow']
+  }).catch((err) => {
+    amapLoadPromise = null
+    throw err
+  })
+
+  return amapLoadPromise
+}
+
+const normalizeLngLat = (location: any): [number, number] | null => {
+  if (!location) return null
+
+  if (Array.isArray(location) && location.length >= 2) {
+    const lng = Number(location[0])
+    const lat = Number(location[1])
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) return null
+    if (lng < -180 || lng > 180 || lat < -90 || lat > 90) return null
+    return [lng, lat]
+  }
+
+  if (typeof location === 'string') {
+    const parts = location.split(',').map((part) => Number(part.trim()))
+    if (parts.length >= 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1])) {
+      const lng = parts[0]
+      const lat = parts[1]
+      if (lng < -180 || lng > 180 || lat < -90 || lat > 90) return null
+      return [lng, lat]
+    }
+    return null
+  }
+
+  const lng = Number(location.longitude ?? location.lng ?? location.lon)
+  const lat = Number(location.latitude ?? location.lat)
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return null
+  if (lng < -180 || lng > 180 || lat < -90 || lat > 90) return null
+  if (Math.abs(lng) < 1e-6 && Math.abs(lat) < 1e-6) return null
+  return [lng, lat]
+}
+
 const initMap = async () => {
   try {
-    const AMap = await AMapLoader.load({
-      key: import.meta.env.VITE_AMAP_WEB_JS_KEY,  // 高德地图Web端(JS API) Key
-      version: '2.0',
-      plugins: ['AMap.Marker', 'AMap.Polyline', 'AMap.InfoWindow']
-    })
+    const AMap = await loadAmapSdk()
 
-    // 创建地图实例
+    if (map) {
+      map.destroy()
+      map = null
+    }
+
     map = new AMap.Map('amap-container', {
       zoom: 12,
-      center: [116.397128, 39.916527], // 默认中心点(北京)
+      center: [116.397128, 39.916527],
       viewMode: '3D'
     })
 
-    // 添加景点标记
-    addAttractionMarkers(AMap)
+    map.on('error', (evt: any) => {
+      console.error('高德底图加载异常:', evt)
+      message.warning('地图底图加载异常，请检查 JS Key 绑定域名与安全密钥配置。')
+    })
 
-    message.success('地图加载成功')
-  } catch (error) {
+    addAttractionMarkers(AMap)
+  } catch (error: any) {
     console.error('地图加载失败:', error)
-    message.error('地图加载失败')
+    message.error(`地图加载失败: ${error?.message || error}`)
   }
 }
 
-// 添加景点标记
 const addAttractionMarkers = (AMap: any) => {
-  if (!tripPlan.value) return
+  if (!tripPlan.value || !map) return
 
   const markers: any[] = []
   const allAttractions: any[] = []
 
-  // 收集所有景点
   tripPlan.value.days.forEach((day, dayIndex) => {
     day.attractions.forEach((attraction, attrIndex) => {
-      if (attraction.location && attraction.location.longitude && attraction.location.latitude) {
-        allAttractions.push({
-          ...attraction,
-          dayIndex,
-          attrIndex
-        })
-      }
+      const lnglat = normalizeLngLat((attraction as any).location)
+      if (!lnglat) return
+      allAttractions.push({
+        ...attraction,
+        dayIndex,
+        attrIndex,
+        lnglat
+      })
     })
   })
 
-  // 创建标记
+  if (allAttractions.length === 0) {
+    message.warning('地图未获取到有效景点坐标，已使用默认中心点。')
+    return
+  }
+
+  const coordKeys = allAttractions.map((a) => `${a.lnglat[0].toFixed(6)},${a.lnglat[1].toFixed(6)}`)
+  const uniqueCoordCount = new Set(coordKeys).size
+  if (allAttractions.length > 1 && uniqueCoordCount <= 1) {
+    message.warning('景点坐标几乎全部重叠，可能是上游返回了重复坐标。')
+  }
+
   allAttractions.forEach((attraction, index) => {
     const marker = new AMap.Marker({
-      position: [attraction.location.longitude, attraction.location.latitude],
+      position: attraction.lnglat,
       title: attraction.name,
       label: {
         content: `<div style="background: #4CAF50; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px;">${index + 1}</div>`,
@@ -886,7 +912,6 @@ const addAttractionMarkers = (AMap: any) => {
       }
     })
 
-    // 创建信息窗口
     const infoWindow = new AMap.InfoWindow({
       content: `
         <div style="padding: 10px;">
@@ -900,7 +925,6 @@ const addAttractionMarkers = (AMap: any) => {
       offset: new AMap.Pixel(0, -30)
     })
 
-    // 点击标记显示信息窗口
     marker.on('click', () => {
       infoWindow.open(map, marker.getPosition())
     })
@@ -908,23 +932,16 @@ const addAttractionMarkers = (AMap: any) => {
     markers.push(marker)
   })
 
-  // 添加标记到地图
   map.add(markers)
+  map.setCenter(allAttractions[0].lnglat)
+  map.setFitView(markers)
 
-  // 自动调整视野以包含所有标记
-  if (allAttractions.length > 0) {
-    map.setFitView(markers)
-  }
-
-  // 绘制路线
   drawRoutes(AMap, allAttractions)
 }
 
-// 绘制路线
 const drawRoutes = (AMap: any, attractions: any[]) => {
-  if (attractions.length < 2) return
+  if (attractions.length < 2 || !map) return
 
-  // 按天分组绘制路线
   const dayGroups: any = {}
   attractions.forEach(attr => {
     if (!dayGroups[attr.dayIndex]) {
@@ -933,22 +950,22 @@ const drawRoutes = (AMap: any, attractions: any[]) => {
     dayGroups[attr.dayIndex].push(attr)
   })
 
-  // 为每天的景点绘制路线
   Object.values(dayGroups).forEach((dayAttractions: any) => {
     if (dayAttractions.length < 2) return
 
-    const path = dayAttractions.map((attr: any) => [
-      attr.location.longitude,
-      attr.location.latitude
-    ])
+    const path = dayAttractions
+      .map((attr: any) => attr.lnglat || normalizeLngLat(attr.location))
+      .filter((p: any) => Array.isArray(p) && p.length === 2)
+
+    if (path.length < 2) return
 
     const polyline = new AMap.Polyline({
-      path: path,
+      path,
       strokeColor: '#1890ff',
       strokeWeight: 4,
       strokeOpacity: 0.8,
       strokeStyle: 'solid',
-      showDir: true // 显示方向箭头
+      showDir: true
     })
 
     map.add(polyline)

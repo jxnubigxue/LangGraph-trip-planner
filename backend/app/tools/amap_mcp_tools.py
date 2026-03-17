@@ -3,6 +3,9 @@
 from typing import List, Dict, Any, Optional, Type
 import asyncio
 import logging
+import os
+import shutil
+import sys
 import nest_asyncio
 import inspect
 import json
@@ -13,11 +16,32 @@ except ImportError:
     MCP_ADAPTERS_AVAILABLE = False
     load_mcp_tools = None
 from langchain_core.tools import BaseTool, StructuredTool, tool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from ..config import get_settings
 
 # 设置日志记录
 logger = logging.getLogger(__name__)
+
+
+def _build_mcp_connection(amap_api_key: str) -> Dict[str, Any]:
+    """Build MCP stdio connection and auto-select launcher command.
+
+    Priority:
+    1. uvx amap-mcp-server
+    2. npx -y amap-mcp-server
+    """
+    env = {"AMAP_MAPS_API_KEY": amap_api_key}
+    # Prefer uvx from current Python environment when PATH is incomplete.
+    uvx_local = os.path.join(os.path.dirname(sys.executable), "Scripts", "uvx.exe")
+    if os.path.exists(uvx_local):
+        return {"command": uvx_local, "args": ["amap-mcp-server"], "transport": "stdio", "env": env}
+    if shutil.which("uvx"):
+        return {"command": "uvx", "args": ["amap-mcp-server"], "transport": "stdio", "env": env}
+    if shutil.which("npx"):
+        return {"command": "npx", "args": ["-y", "amap-mcp-server"], "transport": "stdio", "env": env}
+
+    logger.warning("未检测到 uvx/npx，MCP工具可能无法启动。")
+    return {"command": "uvx", "args": ["amap-mcp-server"], "transport": "stdio", "env": env}
 
 
 def wrap_async_tools(tools: List[BaseTool]) -> List[BaseTool]:
@@ -114,12 +138,7 @@ async def create_amap_mcp_tools() -> List[BaseTool]:
     try:
 
         # 创建连接配置
-        connection = {
-            "command": "uvx",
-            "args": ["amap-mcp-server"],
-            "transport": "stdio",
-            "env": {"AMAP_MAPS_API_KEY": settings.amap_api_key}
-        }
+        connection = _build_mcp_connection(settings.amap_api_key)
 
         logger.info("正在连接高德地图MCP服务器...")
 
@@ -183,12 +202,7 @@ def get_amap_essential_tools() -> List[BaseTool]:
     try:
         # 使用异步函数加载工具，然后过滤出主要工具
         async def load_and_filter():
-            connection = {
-                "command": "uvx",
-                "args": ["amap-mcp-server"],
-                "transport": "stdio",
-                "env": {"AMAP_MAPS_API_KEY": settings.amap_api_key}
-            }
+            connection = _build_mcp_connection(settings.amap_api_key)
 
             tools = await load_mcp_tools(
                 session=None,
@@ -267,8 +281,16 @@ def clear_tools_cache():
 
 class SearchInput(BaseModel):
     """景点搜索输入参数"""
-    query: str = Field(description="搜索查询，如'北京景点'")
+    keywords: Optional[str] = Field(default=None, description="搜索关键词，如'北京景点'")
+    query: Optional[str] = Field(default=None, description="兼容字段：搜索查询，如'北京景点'")
     city: str = Field(description="城市名称")
+
+    @model_validator(mode="after")
+    def validate_query_field(self):
+        """兼容 keywords/query 两种字段名。"""
+        if not self.keywords and not self.query:
+            raise ValueError("keywords 或 query 至少提供一个")
+        return self
 
 
 class WeatherInput(BaseModel):
@@ -281,9 +303,10 @@ def create_mock_tools() -> List[BaseTool]:
     logger.info("创建模拟工具...")
 
     @tool("maps_text_search", args_schema=SearchInput)
-    def mock_search_tool(query: str, city: str) -> str:
+    def mock_search_tool(city: str, keywords: Optional[str] = None, query: Optional[str] = None) -> str:
         """模拟景点搜索工具"""
-        logger.info(f"模拟搜索: {query} in {city}")
+        effective_query = (keywords or query or "").strip()
+        logger.info(f"模拟搜索: {effective_query} in {city}")
 
         # 返回模拟的景点数据
         mock_results = [

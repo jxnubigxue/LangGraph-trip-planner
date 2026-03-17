@@ -72,8 +72,8 @@ more-itertools==10.8.0
 multidict==6.7.1
 mypy_extensions==1.1.0
 nest-asyncio==1.6.0
-networkx==3.6.1
-numpy==2.4.2
+networkx==3.4.2
+numpy==2.2.6
 openai==2.23.0
 openapi-pydantic==0.5.1
 opentelemetry-api==1.39.1

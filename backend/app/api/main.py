@@ -1,13 +1,20 @@
 """FastAPI主应用"""
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from ..config import get_settings, validate_config, print_config
-from .routes import trip, poi, map as map_routes
 import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+import time
+import uuid
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from ..config import get_settings, print_config, validate_config
+from ..logging_config import logging_context, setup_logging
+from .routes import map as map_routes
+from .routes import poi, trip
+
 # 获取配置
 settings = get_settings()
+setup_logging(settings.log_level)
+logger = logging.getLogger(__name__)
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -31,6 +38,34 @@ app.add_middleware(
 app.include_router(trip.router, prefix="/api")
 app.include_router(poi.router, prefix="/api")
 app.include_router(map_routes.router, prefix="/api")
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    """Attach request id and request timing logs."""
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    start = time.perf_counter()
+    client = request.client.host if request.client else "-"
+
+    with logging_context(request_id=request_id):
+        logger.info("http_request_start method=%s path=%s client=%s", request.method, request.url.path, client)
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            logger.exception("http_request_error method=%s path=%s elapsed_ms=%d", request.method, request.url.path, elapsed_ms)
+            raise
+
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            "http_request_end method=%s path=%s status=%s elapsed_ms=%d",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+        )
+        return response
 
 
 @app.on_event("startup")

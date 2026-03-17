@@ -1,11 +1,14 @@
 """旅行规划API路由 (LangGraph 版本)"""
 
-from fastapi import APIRouter, HTTPException
 import logging
+import time
+import uuid
+
+from fastapi import APIRouter, HTTPException
+from ...logging_config import logging_context
 from ...models.schemas import (
-    TripRequest,
     TripPlanResponse,
-    ErrorResponse
+    TripRequest,
 )
 # 从新的工作流导入
 from ...workflows.trip_planner_graph import get_trip_planner_workflow
@@ -30,35 +33,45 @@ async def plan_trip(request: TripRequest):
     Returns:
         旅行计划响应
     """
+    run_id = uuid.uuid4().hex[:8]
+    start = time.perf_counter()
     try:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"📥 收到旅行规划请求 (LangGraph):")
-        logger.info(f"   城市: {request.city}")
-        logger.info(f"   日期: {request.start_date} - {request.end_date}")
-        logger.info(f"   天数: {request.travel_days}")
-        logger.info(f"{'='*60}\n")
+        with logging_context(run_id=run_id):
+            logger.info(
+                "trip_request_start city=%s start=%s end=%s days=%d",
+                request.city,
+                request.start_date,
+                request.end_date,
+                request.travel_days,
+            )
 
-        # 获取工作流实例
-        logger.info("🔄 获取 LangGraph 工作流实例...")
-        workflow = get_trip_planner_workflow()
+            # 获取工作流实例
+            workflow = get_trip_planner_workflow()
 
-        # 执行工作流
-        logger.info("🚀 开始执行工作流...")
-        trip_plan = workflow.plan_trip(request)
+            # 执行工作流
+            trip_plan = workflow.plan_trip(request)
 
-        logger.info("✅ 旅行计划生成成功,准备返回响应\n")
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            logger.info(
+                "trip_request_success city=%s days=%d elapsed_ms=%d",
+                request.city,
+                len(trip_plan.days) if trip_plan else 0,
+                elapsed_ms,
+            )
 
-        return TripPlanResponse(
-            success=True,
-            message="旅行计划生成成功 (LangGraph)",
-            data=trip_plan
-        )
+            return TripPlanResponse(
+                success=True,
+                message="旅行计划生成成功 (LangGraph)",
+                data=trip_plan
+            )
 
-    except Exception as e:
-        logger.error(f"❌ 生成旅行计划失败: {str(e)}", exc_info=True)
+    except Exception as exc:
+        with logging_context(run_id=run_id):
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            logger.error("trip_request_failed elapsed_ms=%d error=%s", elapsed_ms, str(exc), exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"生成旅行计划失败: {str(e)}"
+            detail=f"生成旅行计划失败: {str(exc)}"
         )
 
 

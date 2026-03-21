@@ -247,6 +247,7 @@
                   :label="getMealLabel(meal.type)"
                 >
                   {{ meal.name }}
+                  <span v-if="meal.address">（{{ meal.address }}）</span>
                   <span v-if="meal.description"> - {{ meal.description }}</span>
                 </a-descriptions-item>
               </a-descriptions>

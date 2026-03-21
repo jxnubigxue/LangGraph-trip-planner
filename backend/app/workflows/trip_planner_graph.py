@@ -443,6 +443,12 @@ class TripPlannerWorkflow:
                 state.get("weather_info", []),
                 state.get("hotels", []),
             )
+            query += (
+                "\n\n餐饮补充要求:\n"
+                "1) 每天 breakfast/lunch/dinner 三餐都要返回。\n"
+                "2) meals.name 必须是具体餐厅名，禁止模板占位词。\n"
+                "3) meals.address 尽量提供具体地址，description 给一句推荐理由。\n"
+            )
             output = self._invoke_llm_text(query)
             trip_plan = self._parse_trip_plan(
                 output,
@@ -2036,7 +2042,7 @@ class TripPlannerWorkflow:
                 meals.append(
                     Meal(
                         type=self._safe_str(md.get("type"), "lunch"),
-                        name=self._safe_str(md.get("name"), "餐食推荐"),
+                        name=self._safe_str(md.get("name"), ""),
                         address=self._safe_str(md.get("address"), "") or None,
                         location=meal_loc,
                         description=self._safe_str(md.get("description"), "") or None,
@@ -2442,15 +2448,19 @@ class TripPlannerWorkflow:
         for meal in meals:
             meal_type = self._safe_str(getattr(meal, "type", ""), "").lower()
             if meal_type not in {"breakfast", "lunch", "dinner", "snack"}:
-                meal_type = "snack"
+                continue
+
             fixed = Meal(
                 type=meal_type,
-                name=self._safe_str(getattr(meal, "name", ""), "餐食推荐"),
+                name=self._safe_str(getattr(meal, "name", ""), ""),
                 address=getattr(meal, "address", None),
                 location=getattr(meal, "location", None),
                 description=self._safe_str(getattr(meal, "description", ""), "") or None,
                 estimated_cost=self._safe_int(getattr(meal, "estimated_cost", 0), 0),
             )
+            if not self._safe_str(fixed.name, ""):
+                continue
+
             if meal_type in required_types and meal_type not in by_type:
                 by_type[meal_type] = fixed
             elif meal_type == "snack":
@@ -2459,9 +2469,8 @@ class TripPlannerWorkflow:
         ensured: List[Meal] = []
         for meal_type in required_types:
             meal = by_type.get(meal_type)
-            if meal is None or not self._safe_str(meal.name, ""):
-                meal = self._build_default_meal(meal_type, request, attractions, day_index)
-            ensured.append(meal)
+            if meal is not None:
+                ensured.append(meal)
 
         ensured.extend(extra_snacks[:1])
         return ensured

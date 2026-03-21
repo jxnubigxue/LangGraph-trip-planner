@@ -44,6 +44,7 @@ ENV/
 .pytest_cache/
 .coverage
 htmlcov/
+evals/reports/
 
 # 操作系统
 .DS_Store

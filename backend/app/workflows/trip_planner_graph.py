@@ -162,6 +162,7 @@ class TripPlannerWorkflow:
         breakdown = state.get("task_breakdown") or {}
         attraction_task = breakdown.get("attraction", {}) if isinstance(breakdown, dict) else {}
         keyword = self._safe_str(attraction_task.get("keywords"), "热门景点")
+        target_count = min(30, max(3, self._safe_int(getattr(request, "travel_days", 1), 1) * 3))
 
         # MCP first
         source = "mcp"
@@ -172,6 +173,65 @@ class TripPlannerWorkflow:
             non_food = [a for a in attractions if not self._is_food_poi(a)]
             if non_food:
                 attractions = non_food
+
+            attractions = self._merge_unique_attractions(
+                [a for a in attractions if self._is_valid_location(a.location)],
+                max_items=30,
+            )
+
+            if len(attractions) < target_count:
+                preference_text = " ".join(
+                    [self._safe_str(p, "") for p in (getattr(request, "preferences", None) or [])]
+                )
+                probe_keywords: List[str] = [
+                    "热门景点",
+                    "城市地标",
+                    "历史文化景点",
+                    "博物馆",
+                    "风景名胜",
+                    "城市公园",
+                ]
+                if "历史" in preference_text or "文化" in preference_text:
+                    probe_keywords.insert(0, "历史古迹")
+                if "自然" in preference_text:
+                    probe_keywords.insert(0, "自然景观")
+
+                seen_probe: set[str] = set()
+                boost_rounds = 0
+                before_boost = len(attractions)
+                for probe in probe_keywords:
+                    if len(attractions) >= target_count:
+                        break
+                    probe_key = self._normalize_name(probe)
+                    if not probe_key or probe_key in seen_probe:
+                        continue
+                    seen_probe.add(probe_key)
+                    if probe_key == self._normalize_name(keyword):
+                        continue
+
+                    probe_raw = self._invoke_maps_text_search(request.city, probe)
+                    if not probe_raw:
+                        continue
+                    probe_items = self._parse_attractions(probe_raw)
+                    probe_items = [
+                        a
+                        for a in probe_items
+                        if self._is_valid_location(a.location) and not self._is_food_poi(a)
+                    ]
+                    if not probe_items:
+                        continue
+                    boost_rounds += 1
+                    attractions = self._merge_unique_attractions(attractions + probe_items, max_items=30)
+
+                if boost_rounds > 0:
+                    logger.info(
+                        "attraction_recall_boost city=%s before=%d after=%d target=%d rounds=%d",
+                        request.city,
+                        before_boost,
+                        len(attractions),
+                        target_count,
+                        boost_rounds,
+                    )
 
         # fallback: self-generate via LLM
         if not attractions:
@@ -198,13 +258,17 @@ class TripPlannerWorkflow:
             if in_city:
                 attractions = in_city
 
-        attractions = self._merge_unique_attractions([a for a in attractions if self._is_valid_location(a.location)], max_items=30)
+        attractions = self._merge_unique_attractions(
+            [a for a in attractions if self._is_valid_location(a.location)],
+            max_items=30,
+        )
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
-            "node_done node=search_attractions source=%s count=%d elapsed_ms=%d",
+            "node_done node=search_attractions source=%s count=%d target=%d elapsed_ms=%d",
             source,
             len(attractions),
+            target_count,
             elapsed_ms,
         )
         return {
@@ -1444,19 +1508,64 @@ class TripPlannerWorkflow:
                 error_text = self._extract_tool_error(parsed)
                 if error_text:
                     return None
+                detail_payload = self._normalize_detail_payload(parsed)
                 with self._poi_detail_cache_lock:
-                    self._poi_detail_cache[pid] = parsed
-                return parsed
+                    self._poi_detail_cache[pid] = detail_payload
+                return detail_payload
+            if isinstance(parsed, list):
+                for record in parsed:
+                    if isinstance(record, dict):
+                        detail_payload = self._normalize_detail_payload(record)
+                        with self._poi_detail_cache_lock:
+                            self._poi_detail_cache[pid] = detail_payload
+                        return detail_payload
         except Exception:
             return None
         return None
+
+    def _normalize_detail_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+
+        # Some providers wrap detail fields under pois/data/items.
+        candidates: List[Dict[str, Any]] = [payload]
+        for key in ("pois", "data", "results", "items", "list"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                candidates.append(value)
+            elif isinstance(value, list):
+                candidates.extend([x for x in value if isinstance(x, dict)])
+
+        for item in candidates:
+            has_core = any(
+                self._safe_str(item.get(k), "")
+                for k in ("name", "address", "location", "type", "typecode", "adname", "district")
+            )
+            if has_core:
+                return item
+        return payload
 
     def _enrich_item_with_detail(self, item: Dict[str, Any]) -> Dict[str, Any]:
         detail = self._invoke_maps_search_detail(item.get("id") or item.get("poi_id") or "")
         if not isinstance(detail, dict):
             return item
         merged = dict(item)
-        for key in ("name", "address", "location", "city", "type", "rating"):
+        for key in (
+            "name",
+            "address",
+            "location",
+            "city",
+            "cityname",
+            "adname",
+            "district",
+            "type",
+            "typecode",
+            "rating",
+            "description",
+            "photos",
+            "tel",
+            "business_area",
+        ):
             value = detail.get(key)
             if value not in (None, "", []):
                 merged[key] = value
@@ -1562,6 +1671,70 @@ class TripPlannerWorkflow:
             return False
         return not (abs(lng) < 1e-8 and abs(lat) < 1e-8)
 
+    def _is_incomplete_address(self, address: str) -> bool:
+        text = re.sub(r"\s+", "", self._safe_str(address, ""))
+        if not text:
+            return True
+        if text in {"未知", "暂无", "不详", "市内", "城区"}:
+            return True
+        return len(text) < 4
+
+    def _is_incomplete_description(self, description: str) -> bool:
+        text = re.sub(r"\s+", "", self._safe_str(description, ""))
+        if not text:
+            return True
+        if len(text) < 14:
+            return True
+        low_info_tokens = ("著名景点", "值得一游", "风景优美", "打卡地", "热门景点")
+        if any(token in text for token in low_info_tokens) and len(text) < 26:
+            return True
+        return False
+
+    def _fallback_attraction_address(self, item: Dict[str, Any], city: str = "") -> str:
+        candidates = [
+            item.get("address"),
+            item.get("adname"),
+            item.get("district"),
+            item.get("business_area"),
+            item.get("cityname"),
+            item.get("city"),
+        ]
+        for value in candidates:
+            text = self._safe_str(value, "")
+            if not self._is_incomplete_address(text):
+                return text
+        city_text = self._safe_str(city, "") or self._safe_str(item.get("city") or item.get("cityname"), "")
+        return f"{city_text}市区" if city_text else "地址待补充"
+
+    def _fallback_attraction_description(
+        self,
+        item: Dict[str, Any],
+        name: str,
+        category: str,
+        address: str,
+        city: str = "",
+        visit_duration: int = 120,
+    ) -> str:
+        for key in ("description", "intro", "summary"):
+            text = self._safe_str(item.get(key), "")
+            if not self._is_incomplete_description(text):
+                return text
+        city_text = self._safe_str(city, "") or self._safe_str(item.get("city") or item.get("cityname"), "")
+        location_text = address if not self._is_incomplete_address(address) else (city_text or "当地")
+        category_text = self._safe_str(category, "") or "景点"
+        minutes = max(30, self._safe_int(visit_duration, 120))
+        return f"{name}位于{location_text}，属于{category_text}类景点，建议安排约{minutes}分钟游览。"
+
+    def _needs_attraction_detail(self, item: Dict[str, Any]) -> bool:
+        if not isinstance(item, dict):
+            return False
+        location = self._parse_location(item.get("location"), item)
+        if not self._is_valid_location(location):
+            return True
+        address = self._safe_str(item.get("address"), "")
+        description = self._safe_str(item.get("description"), "")
+        return self._is_incomplete_address(address) or self._is_incomplete_description(description)
+
     def _parse_attractions(self, response: str) -> List[Attraction]:
         started = time.perf_counter()
         parsed = self._safe_parse_json_payload(response)
@@ -1573,23 +1746,35 @@ class TripPlannerWorkflow:
         detail_budget = 10
         raw_items, detail_calls = self._enrich_items_with_detail(
             raw_items,
-            should_enrich=lambda item: not self._is_valid_location(self._parse_location(item.get("location"), item)),
+            should_enrich=self._needs_attraction_detail,
             detail_budget=detail_budget,
         )
         for enriched in raw_items:
             location = self._parse_location(enriched.get("location"), enriched)
             if not self._is_valid_location(location):
                 continue
+
+            name = self._safe_str(enriched.get("name"), "未知景点")
             category = self._safe_str(enriched.get("category"), "")
             if not category:
                 category = self._safe_str(enriched.get("type") or enriched.get("typecode"), "景点")
+            city_name = self._safe_str(enriched.get("city") or enriched.get("cityname"), "")
+            address = self._fallback_attraction_address(enriched, city=city_name)
+            description = self._fallback_attraction_description(
+                enriched,
+                name=name,
+                category=category,
+                address=address,
+                city=city_name,
+                visit_duration=self._safe_int(enriched.get("visit_duration"), 120),
+            )
             attractions.append(
                 Attraction(
-                    name=self._safe_str(enriched.get("name"), "未知景点"),
-                    address=self._safe_str(enriched.get("address"), ""),
+                    name=name,
+                    address=address,
                     location=location,
                     visit_duration=self._safe_int(enriched.get("visit_duration"), 120),
-                    description=self._safe_str(enriched.get("description"), ""),
+                    description=description,
                     category=category or "景点",
                     rating=self._safe_float(enriched.get("rating"), 0.0) if enriched.get("rating") is not None else None,
                     photos=enriched.get("photos") if isinstance(enriched.get("photos"), list) else [],
@@ -1598,6 +1783,7 @@ class TripPlannerWorkflow:
                     ticket_price=self._safe_int(enriched.get("ticket_price"), 0),
                 )
             )
+
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
             "parse_done type=attractions records=%d output=%d detail_calls=%d elapsed_ms=%d",
@@ -1760,30 +1946,47 @@ class TripPlannerWorkflow:
             day_data = raw_day if isinstance(raw_day, dict) else {}
 
             attractions: List[Attraction] = []
-            for ad in day_data.get("attractions", []):
+            dropped_attractions = 0
+            day_attractions_raw = day_data.get("attractions", [])
+            for ad in day_attractions_raw:
                 if not isinstance(ad, dict):
                     continue
 
                 name = self._safe_str(ad.get("name"), "未知景点")
                 matched = self._match_index_item(attraction_index, name)
-                if source_attractions and matched is None:
-                    # When MCP attractions are available, avoid cross-city hallucinated spots.
-                    continue
                 location = self._parse_location(ad.get("location"), ad)
                 if not self._is_valid_location(location):
                     matched_loc = self._item_location(matched)
                     if matched_loc is not None:
                         location = matched_loc
                 if not self._is_valid_location(location):
+                    dropped_attractions += 1
+                    logger.debug("trip_plan_attraction_drop day=%d reason=invalid_location name=%s", idx, name)
                     continue
 
-                address = self._safe_str(ad.get("address"), "")
-                if not address:
-                    address = self._item_address(matched)
+                if source_attractions and matched is None:
+                    logger.debug("trip_plan_attraction_unmatched day=%d name=%s", idx, name)
 
-                description = self._safe_str(ad.get("description"), "")
-                if not description:
-                    description = self._item_description(matched)
+                category = self._safe_str(ad.get("category"), "")
+                if not category:
+                    category = self._safe_str(ad.get("type") or ad.get("typecode"), "景点")
+
+                address = self._fallback_attraction_address(ad, city=request.city)
+                matched_address = self._item_address(matched)
+                if self._is_incomplete_address(address) and not self._is_incomplete_address(matched_address):
+                    address = matched_address
+
+                description = self._fallback_attraction_description(
+                    ad,
+                    name=name,
+                    category=category,
+                    address=address,
+                    city=request.city,
+                    visit_duration=self._safe_int(ad.get("visit_duration"), 120),
+                )
+                matched_desc = self._item_description(matched)
+                if self._is_incomplete_description(description) and not self._is_incomplete_description(matched_desc):
+                    description = matched_desc
 
                 ticket_price = self._safe_int(ad.get("ticket_price"), 0)
                 if ticket_price <= 0:
@@ -1796,9 +1999,17 @@ class TripPlannerWorkflow:
                         location=location,
                         visit_duration=self._safe_int(ad.get("visit_duration"), 120),
                         description=description,
-                        category=self._safe_str(ad.get("category"), "景点"),
+                        category=category or "景点",
                         ticket_price=ticket_price,
                     )
+                )
+
+            if dropped_attractions > 0:
+                logger.info(
+                    "trip_plan_attraction_drop_summary day=%d input=%d dropped=%d",
+                    idx,
+                    len(day_attractions_raw) if isinstance(day_attractions_raw, list) else 0,
+                    dropped_attractions,
                 )
 
             non_food_attractions = [a for a in attractions if not self._is_food_poi(a)]
@@ -1917,27 +2128,73 @@ class TripPlannerWorkflow:
         normalized = re.sub(r"[()（）\[\]【】,，.。:：·•\-_/\\]", "", normalized)
         return normalized
 
+    def _name_aliases(self, name: str) -> List[str]:
+        raw = self._safe_str(name, "")
+        base_key = self._normalize_name(raw)
+        if not base_key:
+            return []
+
+        aliases: List[str] = [base_key]
+        base_text = re.split(r"[（(]", raw, maxsplit=1)[0]
+        part_candidates = re.split(r"[-—·•/｜|]", base_text)
+        for part in part_candidates:
+            key = self._normalize_name(part)
+            if key and len(key) >= 2:
+                aliases.append(key)
+
+        suffixes = (
+            "景区",
+            "风景区",
+            "旅游区",
+            "国家公园",
+            "湿地公园",
+            "公园",
+            "博物馆",
+            "美术馆",
+            "展览馆",
+            "遗址",
+            "古镇",
+            "景点",
+        )
+        for suffix in suffixes:
+            sfx = self._normalize_name(suffix)
+            if sfx and base_key.endswith(sfx) and len(base_key) > len(sfx) + 1:
+                aliases.append(base_key[: -len(sfx)])
+
+        unique: List[str] = []
+        seen: set[str] = set()
+        for alias in aliases:
+            if alias in seen:
+                continue
+            seen.add(alias)
+            unique.append(alias)
+        return unique
+
     def _build_name_index(self, items: List[Any]) -> Dict[str, List[Any]]:
         index: Dict[str, List[Any]] = {}
         for item in items:
             item_name = self._item_name(item)
-            key = self._normalize_name(item_name)
-            if not key:
-                continue
-            index.setdefault(key, []).append(item)
+            keys = self._name_aliases(item_name)
+            for key in keys:
+                index.setdefault(key, []).append(item)
         return index
 
     def _match_index_item(self, index: Dict[str, List[Any]], name: str) -> Optional[Any]:
-        key = self._normalize_name(name)
-        if not key:
+        keys = self._name_aliases(name)
+        if not keys:
             return None
-        if key in index and index[key]:
-            return index[key][0]
-        for idx_key, values in index.items():
-            if not values:
-                continue
-            if key in idx_key or idx_key in key:
-                return values[0]
+
+        for key in keys:
+            if key in index and index[key]:
+                return index[key][0]
+
+        # Fall back to substring match with longer aliases first.
+        for key in sorted(keys, key=len, reverse=True):
+            for idx_key, values in index.items():
+                if not values:
+                    continue
+                if key in idx_key or idx_key in key:
+                    return values[0]
         return None
 
     def _item_name(self, item: Any) -> str:
